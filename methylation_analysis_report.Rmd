@@ -1,0 +1,488 @@
+---
+title: \textbf{{Differential Methylation Analysis}}
+author: Aina Montalban
+abstractspacing: double
+fontsize: 12pt
+margin: 2.5cm
+urlcolor: darkblue
+linkcolor: Mahogany
+spacing: double
+header-includes:
+  - \usepackage{subfig}
+output:
+  pdf_document:
+    df_print: kable
+    citation_package: natbib
+    fig_caption: yes
+    number_sections: yes
+    keep_tex: no
+    toc: yes
+    toc_depth: 3
+params:
+  data: RGChannelSet
+---
+
+
+\newpage
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+library(limma)
+library(minfi)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(IlluminaHumanMethylationEPICmanifest)
+library(RColorBrewer)
+library(Rtsne)
+library(missMethyl)
+library(matrixStats)
+library(minfiData)
+library(Gviz)
+library(stringr)
+library(gplots)
+library(ggplot2)
+library(knitr)
+library(ggrepel)
+```
+
+
+```{r data_import, echo=FALSE}
+#### Master module
+path <- "/mnt/ElRaid/amontalban/PROJECTS/methylation"
+
+# Path to the samplesheet
+#samplesheet_path <- file.path(path, "targets_subset")
+samplesheet_path <- file.path(path, "data")
+
+# Path to the IDAT files
+#IDAT_path <- file.path(path, "data_subset")
+IDAT_path <- file.path(path, "tmp")
+targets <- read.metharray.sheet(samplesheet_path, pattern="sample_sheet_PDX.csv")
+head(targets)
+
+## Notice that the Basename column is not correct. It musts specify the location
+## of each individual IDAT file in the experiment. (w/ the path)
+targets$Basename <- file.path(IDAT_path, targets$Sample_Plate, targets$Slide,
+                              paste(targets$Slide, targets$Array, sep = "_"))
+# Example: "/home/aina/Internship/methylation-minfi/data_subset/SMET0224/201496850086/201496850086_R02C01"
+# In my case, we need: "/home/aina/Internship/methylation-minfi/data_subset/201496850086_R02C01"
+
+targets$Basename <- file.path(IDAT_path,
+                              paste(targets$Slide, targets$Array, sep = "_"))
+
+# Enforce Sample_Name as character.
+targets$Sample_Name <- as.character(targets$Sample_Name)
+
+targets <- targets[targets$Sample_Group != "", ]
+RGSET <- read.metharray.exp(targets=targets, force = TRUE)
+df <- head(targets[,c("Sample_Name", "Sample_Group", "Array", "Slide")], 10)
+annot <- getAnnotation(RGSET)
+```
+
+
+# Data import
+
+This section presents a summary of the data import step.
+
+
+
+```{r, echo=FALSE}
+number_of_samples <- nrow(targets)
+number_of_probes <- nrow(RGSET)
+number_of_features <- ncol(targets)
+annot <- RGSET@annotation[[1]]
+col2 <- c(number_of_samples, number_of_probes, number_of_features, annot)
+col1 <- c("Number of samples", "Number of probes", "Number of features", "Annotation")
+summary_import <- cbind(col1, col2)
+colnames(summary_import) <- c("", "")
+knitr::kable(summary_import, format = "markdown")
+```
+
+```{r, echo=FALSE}
+Features <- colnames(targets)[1:64]
+Type <- lapply(targets[,1:10], function(x){class(x)})
+Example <- lapply(targets[,1:10], function(x){x[1]})
+No.units <- lapply(targets[,1:10], function(x){length(levels(as.factor(x)))})
+Missing <- lapply(targets[,1:10], function(x){sum(is.na(x))})
+target_summary <- cbind(Type, No.units, Missing, Example)
+knitr::kable(target_summary, format = "markdown")
+
+```
+
+
+
+# Quality Control Plots
+
+
+## Detection p-value
+
+```{r, echo=FALSE, fig.align = "center"}
+detP <- detectionP(RGSET)
+pval_means <- colMeans(detP)
+names(pval_means) <- targets$Sample_Name
+df_pval_means <- as.data.frame(pval_means)
+colnames(df_pval_means) <- "pvals"
+p <- ggplot(df_pval_means, aes(x=rownames(df_pval_means), y=pvals)) +
+  geom_col(show.legend = FALSE, color="darkgrey") +
+  theme_classic() +
+  scale_y_continuous(limits=c(0,0.08)) +
+  geom_hline(yintercept = 0.05, color="red") +
+  theme(axis.text.x = element_text(hjust = 1, angle=90, size = 3)) +
+  labs(y="P-values", x="")+
+  geom_hline(yintercept = 0.01, color="green")
+p
+```
+
+
+## Failed Probes
+
+```{r, echo=FALSE, fig.align = "center"}
+probe_detP_max = 0.01
+# Also examine the proportion of failed probes (detP >= probe_detP_max).
+failed_proportion <- apply(detP, 2, function(x) {
+  # All probes detP == 0 means totally failed array.
+  if (sum(x) == 0) {
+    return(NA)
+  } else {
+    failed_probes <- sum(x >= probe_detP_max)
+    return(failed_probes / length(x))
+  }
+})
+names(failed_proportion) <- targets$Sample_Name
+barplot(failed_proportion,
+        ylim = c(0, 0.12),
+        las=2,
+        cex.names=0.8, ylab="Proportion of failed probes")
+abline(h=0.1,col="red")
+abline(h=0.05,col="blue")
+abline(h= 0.01, col = "green")
+legend("topleft", legend=levels(factor(targets$Sample_Group)),
+       bg="white", cex = 0.4)
+```
+
+
+## SNP heatmap
+
+The next plot will check genotyping probes. It will allow to identify if there are samples from same patients and sample swap.
+
+```{r SNPS, echo=FALSE}
+snps <- getSnpBeta(RGSET)
+colnames(snps) <- targets$Sample_Name
+my_palette <- colorRampPalette(c("darkred", "darkgreen", "darkblue"))(n = 299)
+heatmap.2(snps, col = my_palette, trace = "none")
+```
+
+
+
+## Correlation Plot
+```{r, echo=FALSE, out.width = '.49\\linewidth', echo = F, fig.align='center'}
+library(gridExtra)
+library(grid)
+corrmatrix <- cor(snps)
+require(reshape2)
+long <- melt(corrmatrix)
+
+p<-ggplot(as.data.frame(long), aes(x=Var1, y=Var2, fill=value)) + geom_tile() + 
+  theme(axis.text.x = element_blank(), axis.text.y = element_blank(), 
+        axis.ticks = element_blank()) +
+  scale_fill_gradient2(low="white", high ="darkred", mid ="lightgrey" ,
+                       midpoint = 0.5) + xlab("Samples") + ylab("Samples")
+p
+```
+
+
+## Density Plots
+### Beta-distribution
+```{r, echo=FALSE}
+bVals_raw <- getBeta(RGSET)
+densityPlot(bVals_raw, sampGroups = targets$Sample_Group, 
+            legend=FALSE, main="Raw B-values")
+legend("top", legend = levels(factor(targets$Sample_Group)), text.col = brewer.pal(8,"Dark2"))
+```
+
+### M-values distribution
+```{r, echo=FALSE}
+mset <- preprocessRaw(RGSET)
+mVals_raw <- getM(mset)
+densityPlot(bVals_raw, sampGroups = targets$Sample_Group, 
+            legend=FALSE, xlab = "M Values", main = "Raw M-values")
+legend("top", legend = levels(factor(targets$Sample_Group)), text.col = brewer.pal(8,"Dark2"))
+```
+
+# Normalization
+
+
+```{r, echo=FALSE}
+norm_method <- "ssNoob"
+if (norm_method == "Quantile"){
+  GRSetSq <- preprocessQuantile(RGSET)
+  
+} else if (norm_method == "Funnorm") {
+  GRSetSq <- preprocessFunnorm(RGSET)
+  
+} else if (norm_method == "SWAN") {
+  mSetSq <- preprocessSWAN(RGSET)
+  # Convert to RatioSet object.
+  RatioSetSq <- ratioConvert(mSetSq)
+  # Convert to GenomicRatioSet object.
+  GRSetSq <- mapToGenome(RatioSetSq)
+} else if (norm_method == "ssNoob") {
+  mSetSq <- preprocessNoob(RGSET)
+  # Convert to RatioSet object.
+  RatioSetSq <- ratioConvert(mSetSq)
+  # Convert to GenomicRatioSet object.
+  GRSetSq <- mapToGenome(RatioSetSq)
+} else if (norm_method == "Illumina") {
+  mSetSq <- preprocessIllumina(RGSET, bg.correct = TRUE, normalize = "controls",
+                               reference = 1)
+  # Convert to RatioSet object.
+  RatioSetSq <- ratioConvert(mSetSq)
+  # Convert to GenomicRatioSet object.
+  GRSetSq <- mapToGenome(RatioSetSq)
+} else {
+  stop("[ERROR] normalization method not correctly specified.")
+}
+```
+
+## Predicted Sex
+```{r echo=FALSE, warning=FALSE}
+df_pred <- getSex(GRSetSq)
+predictedSex <- df_pred$predictedSex
+kable(table(predictedSex), format = "markdown")
+plotSex(addSex(GRSetSq))
+```
+
+# Filtering
+## Removal of failed probes
+```{r, echo=FALSE}
+#     4.1 Remove failed probes (CpG; or mark as NA)
+detP <- detectionP(RGSET)
+# ensure probes are in the same order in the mSetSq and detP objects
+detP <- detP[match(featureNames(GRSetSq),rownames(detP)),] 
+
+# remove any probes that have failed in one or more samples
+keep <- rowSums(detP < 0.01) == ncol(mSetSq) 
+table(keep)
+# keep
+# FALSE   TRUE 
+# 44026 821833
+GRSetSqFlt <- GRSetSq[keep,]
+r1 <- c(table(keep)[[1]], table(keep)[[2]])
+print(paste(table(keep)[[1]], "probes are removed as they have failed."))
+```
+
+## Removal probes on Sex Chromosomes
+
+```{r, echo=FALSE}
+#     4.2 Remove probes on the sex chromosomes
+annot <- getAnnotation(RGSET)
+# if your data includes males and females, remove probes on the sex chromosomes
+ keep <- !(featureNames(GRSetSqFlt) %in% annot$Name[annot$chr %in% c("chrX","chrY")])
+ table(keep)
+ r2 <- c(table(keep)[[1]], table(keep)[[2]])
+ GRSetSqFlt <- GRSetSqFlt[keep,]
+ df_filtering_summary <- rbind(r1, r2)
+ colnames(df_filtering_summary) <- c("Removed", "Keep")
+ kable(df_filtering_summary, format = "markdown")
+```
+
+## Remove probes with SNPs at CpG site and at a single nucleotide extension
+```{r, echo=FALSE}
+# remove probes with SNPs at CpG site
+GRSetSqFlt <- dropLociWithSnps(GRSetSqFlt)
+```
+
+## Exclude reactive probes
+```{r, echo=FALSE}
+xReactiveProbes <- read.csv(file=paste("/mnt/ElRaid/amontalban/PROJECTS/methylation/illumina450k_filtering-master",
+                                       "EPIC/13059_2016_1066_MOESM1_ESM.csv",
+                                       sep="/"), stringsAsFactors=FALSE)
+keep <- !(featureNames(GRSetSqFlt) %in% xReactiveProbes$TargetID)
+
+table(keep)
+GRSetSqFlt <- GRSetSqFlt[keep,]
+GRSetSqFlt
+```
+
+## B-values calculation
+```{r}
+# Calculte beta-values and m-values filtered
+bVals <- getBeta(GRSetSqFlt)
+head(bVals[,1:5])
+
+```
+
+##  M-values calculation
+```{r}
+mVals <- getM(GRSetSqFlt)
+head(mVals[,1:5])
+```
+
+
+# Differential Methylation Analysis
+
+```{r}
+
+contr <- "Responder-NonResponder"
+# this is the factor of interest
+factorOfInterest <- factor(targets$Sample_Group)
+# this is the individual effect that we need to account for
+#individual <- factor(targets$Sample_Source) 
+
+# use the above to create a design matrix
+design <- model.matrix(~0+factorOfInterest, data=targets)
+colnames(design) <- levels(factorOfInterest)
+# fit the linear model 
+fit <- lmFit(mVals, design)
+# create a contrast matrix for specific comparisons
+
+contMatrix <- makeContrasts(contrasts = contr, levels = design)
+fit2 <- contrasts.fit(fit, contMatrix)
+fit2 <- eBayes(fit2)
+annSub <- annot[match(rownames(mVals), annot$Name), c(1:4, 22:24)]
+DMPs <- topTable(fit2, num=Inf, coef = 1, genelist = annSub)
+summary(decideTests(fit2))
+# > summary(decideTests(fit2))
+# Responder-NonResponder
+# Down                    53749
+# NotSig                 703881
+# Up                      21027
+```
+
+```{r}
+#     7.2 Table with the differential methylated CpGs (DMPs)
+head(DMPs, 10)
+tail(DMPs, 5)
+dim(DMPs)
+```
+
+## Top methylated CpGs
+```{r}
+par(mfrow=c(2,2))
+sapply(rownames(DMPs)[1:4], function(cpg){
+  plotCpg(bVals, 
+          cpg = cpg, 
+          pheno = factor(targets$Sample_Group), 
+          ylab = "Beta values")
+})
+```
+
+## Volcano Plot
+
+```{r}
+require(dplyr)
+volcanoplot(fit2, coef = 1, highlight = 10, names = DMPs$Name)
+```
+
+
+## Manhattan Plot
+
+```{r}
+## Prepare data for the manhattan plt
+nCHR <- length(unique(DMPs$chr))
+chr_NUM <- as.numeric(substr(DMPs$chr, 4, 5))
+DMPs$chr <- chr_NUM
+
+DMPs$BPcum <- NA
+s <- 0
+nbp <- c()
+for (i in sort(unique(DMPs$chr))){
+  nbp[i] <- max(DMPs[DMPs$chr == i,]$pos)
+ # print(DMPs[DMPs$chr == i,"pos"])
+  DMPs[DMPs$chr == i,"BPcum"] <- DMPs[DMPs$chr == i,"pos"] + s
+  s <- s + nbp[i]
+}
+
+sig <- 0.05/nrow(DMPs)
+axisdf <- DMPs %>%
+            group_by(chr) %>%
+              summarize(center=(max(BPcum) + min(BPcum))/2)
+
+manhattanPlot <- ggplot(DMPs, aes(x = BPcum, y = -log10(P.Value))) + 
+            geom_point(aes(colour = as.factor(chr)))
+
+manhattanPlot <- manhattanPlot + labs(x = "Chromosome", y = "-log10(P)", title = "Manhattan Plot") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+manhattanPlot <- manhattanPlot + scale_x_continuous(breaks = axisdf$center, 
+                                                    label = axisdf$chr)
+
+manhattanPlot <- manhattanPlot + geom_hline(aes(yintercept=-log10(sig)))
+
+manhattanPlot <- manhattanPlot + theme(panel.background = element_blank(), 
+                                       legend.position = "none")
+
+mypalette <- c("#E2709A", "#CB4577", "#BD215B", "#970F42", "#75002B") 
+
+manhattanPlot <- manhattanPlot +
+  scale_color_manual(values = rep(mypalette, length(unique(DMPs$chr))))
+manhattanPlot <- manhattanPlot +
+  geom_label_repel(data=head(DMPs[DMPs$P.Value<sig,],5), aes(label=as.factor(Name),
+                                            alpha=0.7), size=3, force=1.3)
+
+manhattanPlot
+```
+
+## Top CpG
+
+```{r}
+topCpG_name <- rownames(DMPs)[1]
+B <- mVals[topCpG_name,]
+names(B) <- targets$Sample_Name
+longB <- melt(B)
+longB <- cbind(longB, targets$Sample_Group)
+colnames(longB) <- c("value", "group")
+class(longB)
+ggplot(longB,  aes(x=group, y=value, fill=group)) + geom_violin(draw_quantiles = c(0.5), alpha=0.5) 
+```
+
+
+# Exploratory analysis
+
+## Multidimensional Scaling (before filtering)
+```{r, echo=FALSE}
+par(mfrow=c(1,2))
+pal <- brewer.pal(8,"Dark2")
+plotMDS(getM(mset), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Sample_Group)], cex=0.8, pch=19, main="M values")
+legend("right", legend=levels(factor(targets$Sample_Group)), text.col=pal,
+       cex=0.65, bg="white")
+plotMDS(getBeta(mset), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Sample_Group)], cex=0.8, pch=19, main="Beta-values")
+legend("right", legend=levels(factor(targets$Sample_Group)), text.col=pal,
+       cex=0.65, bg="white")
+```
+
+
+## Multidimensional Scaling (after filtering)
+```{r}
+par(mfrow=c(1,2))
+  #par(mfrow=c(1,2))
+plotMDS(mVals, top=1000, gene.selection="common", pch=19,
+          col=pal[factor(targets$Sample_Group)], cex=0.8)
+legend("right", legend=levels(factor(targets$Sample_Group)), text.col=pal,
+         cex=0.65, bg="white")
+plotMDS(bVals, top=1000, gene.selection="common", pch=19,
+          col=pal[factor(targets$Sample_Group)], cex=0.8)
+legend("right", legend=levels(factor(targets$Sample_Group)), text.col=pal,
+         cex=0.65, bg="white")
+```
+
+
+
+## t-SNE
+```{r}
+library(Rtsne)
+set.seed(1234)
+bVals_tsne_subset <- sample(which(complete.cases(bVals)), 50000)
+tsne <- Rtsne(t(bVals[bVals_tsne_subset, ]), 
+              dims = 2, 
+              perplexity=6, 
+              verbose=TRUE, 
+              max_iter = 5000)
+
+plot(tsne$Y, t='p', pch = 19, main="tsne", col=pal[factor(targets$Sample_Group)],
+     xlab = "First dimension", ylab = "Second dimension")
+legend("bottomright", legend=levels(factor(targets$Sample_Group)), 
+       text.col=pal[factor(targets$Sample_Group)], cex=0.7, bg="white")
+
+```
+
